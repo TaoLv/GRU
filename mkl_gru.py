@@ -78,7 +78,6 @@ class GRU(gof.Op):
         %(dtype)s* temp;
         %(dtype)s* x_hzr;
 
-        PyArrayObject* hid_state;
         """ % locals()
         return ccode
 
@@ -111,7 +110,6 @@ class GRU(gof.Op):
         temp = NULL;
         x_hzr = NULL;
 
-        hid_state = NULL;
         """ % locals()
         return ccode
 
@@ -140,9 +138,6 @@ class GRU(gof.Op):
             mkl_free(x_hzr);
         }
 
-        if (hid_state) {
-            Py_XDECREF(hid_state);
-        }
         """
         return ccode
 
@@ -185,9 +180,12 @@ class GRU(gof.Op):
             double time_sigmoid = 0.0;
             double time_tanh = 0.0;
             double time_vml = 0.0;
+            double time_bias = 0.0;
+            double time_head = 0.0;
+            double time_middle = 0.0;
+            double time_end = 0.0;
             tic_total = dsecnd();
         #endif
-
             time_step = PyArray_DIMS(%(X)s)[0];
             batch_size = PyArray_DIMS(%(X)s)[1];
             embed_dims = PyArray_DIMS(%(X)s)[2];
@@ -197,7 +195,7 @@ class GRU(gof.Op):
             %(d)s* w_x_ptr = NULL;
             %(d)s* w_h_ptr = NULL;
 
-            // vmlSetMode(vmlGetMode() & 0xFFFFFFF0 | VML_EP);
+            vmlSetMode(vmlGetMode() & 0xFFFFFFF0 | VML_EP);
            
             if (A == NULL) {
                 A = (%(d)s**)mkl_malloc(3 * time_step * sizeof (%(d)s*), 64);
@@ -270,22 +268,22 @@ class GRU(gof.Op):
             }
 
             if (%(with_bias)s) {
-            #pragma omp parallel for num_threads(32)
+                // tic = dsecnd();
+
+                #pragma omp parallel for
                 for (int i = 0; i < time_step; i++) {
-            #pragma omp parallel for num_threads(40)
                     for (int j = 0; j < batch_size; j++) {
-            #pragma omp parallel for num_threads(50)
-                        for (int k = 0; k < %(hid)s; k++) {
-                            size_t offset0 = k + %(hid)s * j + %(hid)s * batch_size * i;
-                            size_t offset1 = k + %(hid)s * j + %(hid)s * batch_size * (i + time_step);
-                            size_t offset2 = k + %(hid)s * j + %(hid)s * batch_size * (i + 2 * time_step);
-                            // printf(\"offset: %%lld, %%lld, %%lld \\n\", offset0, offset1, offset2);
-                            x_hzr[offset0] = ((%(d)s*)PyArray_DATA(%(b)s))[k];
-                            x_hzr[offset1] = ((%(d)s*)PyArray_DATA(%(b)s) + %(hid)s)[k];
-                            x_hzr[offset2] = ((%(d)s*)PyArray_DATA(%(b)s) + 2 * %(hid)s)[k];
-                        }
+                        size_t offset0 = %(hid)s * j + %(hid)s * batch_size * i;
+                        size_t offset1 = %(hid)s * j + %(hid)s * batch_size * (i + time_step);
+                        size_t offset2 = %(hid)s * j + %(hid)s * batch_size * (i + 2 * time_step);
+
+                        memcpy((void*)(x_hzr + offset0), (void*)PyArray_DATA(%(b)s), %(hid)s * sizeof (%(d)s));
+                        memcpy((void*)(x_hzr + offset1), (void*)PyArray_DATA(%(b)s) + %(hid)s *  sizeof (%(d)s), %(hid)s * sizeof (%(d)s));
+                        memcpy((void*)(x_hzr + offset2), (void*)PyArray_DATA(%(b)s) + 2 * %(hid)s * sizeof (%(d)s), %(hid)s * sizeof (%(d)s));
                     }
                 }
+                // toc = dsecnd();
+                // time_bias = toc - tic;
             } else {
                 memset((char*)x_hzr, 0, time_step * 3 * batch_size * %(hid)s * sizeof (%(d)s));
             }
@@ -335,20 +333,8 @@ class GRU(gof.Op):
             }
 
             //// step 3: step on time_step
-            // init hidden state: 80 * 1000
-            dims[0] = batch_size;
-            dims[1] = %(hid)s;
-            if (hid_state == NULL) {
-                hid_state = (PyArrayObject*) PyArray_ZEROS(2, dims, PyArray_TYPE(%(X)s), 0);
-            }
-
-            if (hid_state == NULL) {
-                PyErr_SetString(PyExc_RuntimeError, \"GRU: create and init hidden state failed\");
-                goto gru_fail;
-            }
-
             // loop on step
-            A[0] = (%(d)s*)PyArray_DATA(hid_state);
+            A[0] = (%(d)s*)PyArray_DATA(%(z)s);
             A[1] = A[0];
             A[2] = A[0];
             B[0] = (%(d)s*)PyArray_DATA(%(W_h)s) + %(hid)s * %(hid)s;     // w_hz
@@ -380,29 +366,23 @@ class GRU(gof.Op):
                 // toc = dsecnd();
                 // time_gemm += (toc - tic);
 
-                // sigmoid(C[0])
+                // sigmoid(C[0]), sigmoid(C[1])
                 // tic = dsecnd();
                 int t = 0;
+                #pragma omp parallel for
                 for (t = 0; t < m[0] * n[0]; t++) {
                     C[0][t] = -C[0][t];
-                }
-
-                v%(dtype)sExp(m[0] * n[0], C[0], C[0]);
-                #pragma omp parallel for num_threads(64)
-                for (t = 0; t < m[0] * n[0]; t++) {
-                    C[0][t] = (%(d)s)((double)1.0 / ((double)1.0 + (double)(C[0][t])));
-                }
-
-                // sigmoid(C[1])
-                for (t = 0; t < m[0] * n[0]; t++) {
                     C[1][t] = -C[1][t];
                 }
 
+                v%(dtype)sExp(m[0] * n[0], C[0], C[0]);
                 v%(dtype)sExp(m[0] * n[0], C[1], C[1]);
-                #pragma omp parallel for num_threads(64)
+                #pragma omp parallel for
                 for (t = 0; t < m[0] * n[0]; t++) {
+                    C[0][t] = (%(d)s)((double)1.0 / ((double)1.0 + (double)(C[0][t])));
                     C[1][t] = (%(d)s)((double)1.0 / ((double)1.0 + (double)(C[1][t])));
                 }
+
                 // toc = dsecnd();
                 // time_sigmoid += (toc - tic);
 
@@ -428,21 +408,27 @@ class GRU(gof.Op):
                 // time_tanh += (toc - tic);
 
                 // h_t = (1. - z_t) * h_tm1 + z_t * can_h_t
-                #pragma omp parallel for num_threads(64)
+
+                // tic = dsecnd();
+                #pragma omp parallel for num_threads(16)
                 for (int j = 0; j < batch_size * %(hid)s; j++) {
                     A[0][j] = (%(d)s)( ((double)1.0 - (double)(C[0][j])) * (double)(A[0][j]) + (double)(C[0][j]) * (double)(temp[j]));
                 }
 
                 // set output data
-                if (%(return_sequences)s) {
-                    memcpy((char*)(PyArray_DATA(%(z)s)) + i * batch_size * %(hid)s * sizeof (%(d)s),
+                if (%(return_sequences)s && (i < time_step - 1)) {
+                    %(d)s* ptr = (%(d)s*)PyArray_DATA(%(z)s) + (i + 1) * batch_size * %(hid)s;
+                    memcpy((char*)ptr,
                            (char*)(A[0]),
                            batch_size * %(hid)s * sizeof (%(d)s));
-                } else {
-                    if (i == time_step - 1) {
-                        memcpy((char*)(PyArray_DATA(%(z)s)), (char*)(A[0]), batch_size * %(hid)s * sizeof (%(d)s));
-                    }
+
+                    A[0] = ptr;
+                    A[1] = A[0];
+                    A[2] = A[0];
                 }
+
+                // toc = dsecnd();
+                // time_end += (toc - tic);
             }
 
             gru_fail:
@@ -452,8 +438,10 @@ class GRU(gof.Op):
             toc_total = dsecnd();
             printf(\"gemm: %%.8f\\n\", time_gemm);
             printf(\"sigmoid: %%.8f\\n\", time_sigmoid);
-            printf(\"tnah: %%.8f\\n\", time_tanh);
+            printf(\"tanh: %%.8f\\n\", time_tanh);
             printf(\"vml: %%.8f\\n\", time_vml);
+            printf(\"bias: %%.8f\\n\", time_bias);
+            printf(\"end: %%.8f\\n\", time_end);
             printf(\"total: %%.8f\\n\", (toc_total - tic_total));
         #endif
         """ % locals()
