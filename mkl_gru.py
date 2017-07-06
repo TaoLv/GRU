@@ -169,23 +169,6 @@ class GRU(gof.Op):
                             % (node.inputs[0].type.dtype))
 
         ccode = """
-        #if 0
-            double tic_total = 0.0;
-            double toc_total = 0.0;
-
-            double tic = 0.0;
-            double toc = 0.0;
-
-            double time_gemm = 0.0;
-            double time_sigmoid = 0.0;
-            double time_tanh = 0.0;
-            double time_vml = 0.0;
-            double time_bias = 0.0;
-            double time_head = 0.0;
-            double time_middle = 0.0;
-            double time_end = 0.0;
-            tic_total = dsecnd();
-        #endif
             time_step = PyArray_DIMS(%(X)s)[0];
             batch_size = PyArray_DIMS(%(X)s)[1];
             embed_dims = PyArray_DIMS(%(X)s)[2];
@@ -195,7 +178,7 @@ class GRU(gof.Op):
             %(d)s* w_x_ptr = NULL;
             %(d)s* w_h_ptr = NULL;
 
-            vmlSetMode(vmlGetMode() & 0xFFFFFFF0 | VML_EP);
+            vmlSetMode(vmlGetMode() & 0xFFFFFFF0 | VML_HA);
            
             if (A == NULL) {
                 A = (%(d)s**)mkl_malloc(3 * time_step * sizeof (%(d)s*), 64);
@@ -268,8 +251,6 @@ class GRU(gof.Op):
             }
 
             if (%(with_bias)s) {
-                // tic = dsecnd();
-
                 #pragma omp parallel for
                 for (int i = 0; i < time_step; i++) {
                     for (int j = 0; j < batch_size; j++) {
@@ -282,8 +263,6 @@ class GRU(gof.Op):
                         memcpy((void*)(x_hzr + offset2), (void*)PyArray_DATA(%(b)s) + 2 * %(hid)s * sizeof (%(d)s), %(hid)s * sizeof (%(d)s));
                     }
                 }
-                // toc = dsecnd();
-                // time_bias = toc - tic;
             } else {
                 memset((char*)x_hzr, 0, time_step * 3 * batch_size * %(hid)s * sizeof (%(d)s));
             }
@@ -291,7 +270,7 @@ class GRU(gof.Op):
             m[0] = batch_size;
             k[0] = embed_dims;
             n[0] = %(hid)s;
-            #pragma omp parallel for num_threads(32)
+            #pragma omp parallel for
             for (int i = 0; i < time_step; i++) {
                 A[i] = x_ptr + i * m[0] * k[0];
                 A[i + time_step] = A[i];
@@ -307,11 +286,8 @@ class GRU(gof.Op):
             }
 
             size_per_grp[0] = 3 * time_step;
-            // tic = dsecnd();
             cblas_%(dtype)sgemm_batch(CblasRowMajor, transA, transB, m, n, k,
                                       alpha, A, k, B, n, beta, C, n, 1, size_per_grp);
-            // toc = dsecnd();
-            // time_gemm += toc - tic;
 
             //// step 2. construct output
             if (%(z)s == NULL) {
@@ -360,56 +336,42 @@ class GRU(gof.Op):
                 // z_t = K.sigmoid(x_z + K.dot(h_tm1, self.W_hz) + self.b_z)
                 // r_t = K.sigmoid(x_r + K.dot(h_tm1, self.W_hr) + self.b_r)
 
-                // tic = dsecnd();
                 cblas_%(dtype)sgemm_batch(CblasRowMajor, transA, transB, m, n, k,
                                           alpha, A, k, B, n, beta, C, n, 1, size_per_grp);
-                // toc = dsecnd();
-                // time_gemm += (toc - tic);
 
                 // sigmoid(C[0]), sigmoid(C[1])
-                // tic = dsecnd();
                 int t = 0;
+                /*
                 #pragma omp parallel for
                 for (t = 0; t < m[0] * n[0]; t++) {
                     C[0][t] = -C[0][t];
                     C[1][t] = -C[1][t];
                 }
+                */
 
                 v%(dtype)sExp(m[0] * n[0], C[0], C[0]);
                 v%(dtype)sExp(m[0] * n[0], C[1], C[1]);
                 #pragma omp parallel for
                 for (t = 0; t < m[0] * n[0]; t++) {
-                    C[0][t] = (%(d)s)((double)1.0 / ((double)1.0 + (double)(C[0][t])));
-                    C[1][t] = (%(d)s)((double)1.0 / ((double)1.0 + (double)(C[1][t])));
+                    // C[0][t] = (%(d)s)((double)1.0 / ((double)1.0 + (double)(C[0][t])));
+                    // C[1][t] = (%(d)s)((double)1.0 / ((double)1.0 + (double)(C[1][t])));
+                    C[0][t] = (%(d)s)((double)(C[0][t]) / ((double)1.0 + (double)(C[0][t])));
+                    C[1][t] = (%(d)s)((double)(C[1][t]) / ((double)1.0 + (double)(C[1][t])));
                 }
-
-                // toc = dsecnd();
-                // time_sigmoid += (toc - tic);
 
                 // GEMM -> Mul -> Add -> tanh, can_h_t is stored in temp
                 // can_h_t = K.tanh(x_h + r_t * K.dot(h_tm1, self.W_hh) + self.b_h)
-
-                // tic = dsecnd();
                 cblas_%(dtype)sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m[0], n[0], k[0],
-                                    (%(d)s)1.0, A[2], k[0], B[2], n[0], (%(d)s)0.0, C[2], n[0]);
-                // toc = dsecnd();
-                // time_gemm += (toc - tic);
+                                    1.0, A[2], k[0], B[2], n[0], 0.0, C[2], n[0]);
 
-                // tic = dsecnd();
                 v%(dtype)sMul(batch_size * %(hid)s, C[1], temp, temp);
                 v%(dtype)sAdd(batch_size * %(hid)s, x_hzr + i * m[0] * n[0], temp, temp);
-                // toc = dsecnd();
-                // time_vml += (toc - tic);
 
                 // tanh(temp)
-                // tic = dsecnd();
                 v%(dtype)sTanh(m[0] * n[0], temp, temp);
-                // toc = dsecnd();
-                // time_tanh += (toc - tic);
 
                 // h_t = (1. - z_t) * h_tm1 + z_t * can_h_t
 
-                // tic = dsecnd();
                 #pragma omp parallel for num_threads(16)
                 for (int j = 0; j < batch_size * %(hid)s; j++) {
                     A[0][j] = (%(d)s)( ((double)1.0 - (double)(C[0][j])) * (double)(A[0][j]) + (double)(C[0][j]) * (double)(temp[j]));
@@ -427,23 +389,13 @@ class GRU(gof.Op):
                     A[2] = A[0];
                 }
 
-                // toc = dsecnd();
-                // time_end += (toc - tic);
+                printf(\"%%.9f, %%.9f, %%.9f\\n\", A[0][0], A[0][1000], A[0][batch_size * %(hid)s -1]);
             }
 
             gru_fail:
             Py_XDECREF(x_src);
             Py_XDECREF(w_x_src);
-        #if 0
-            toc_total = dsecnd();
-            printf(\"gemm: %%.8f\\n\", time_gemm);
-            printf(\"sigmoid: %%.8f\\n\", time_sigmoid);
-            printf(\"tanh: %%.8f\\n\", time_tanh);
-            printf(\"vml: %%.8f\\n\", time_vml);
-            printf(\"bias: %%.8f\\n\", time_bias);
-            printf(\"end: %%.8f\\n\", time_end);
-            printf(\"total: %%.8f\\n\", (toc_total - tic_total));
-        #endif
+            Py_XDECREF(w_h_src);
         """ % locals()
         return ccode
 

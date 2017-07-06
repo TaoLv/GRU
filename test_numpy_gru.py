@@ -47,7 +47,7 @@ def GRU_NP():
         can_h_t = np.tanh(t)
 
         hid = (1. - z_t) * hid + z_t * can_h_t
-        # print("%.9f, %.9f, %.9f" %(hid[0,0], hid[1, 0], hid[-1,-1]))
+        print("%.9f, %.9f, %.9f" %(hid[0,0], hid[1, 0], hid[-1,-1]))
     return hid
 
 
@@ -63,13 +63,13 @@ def GRU_MKL():
     f = theano.function([X, W_x, W_h, B], Z)
     #theano.printing.pydotprint(f, outfile='gru.png', var_with_name_simple=True)
 
-    for i in range(100):
-        o = f(x, w_x, w_h, b)
+    # for i in range(100):
+    o = f(x, w_x, w_h, b)
     
     return o[31]
 
 
 if __name__ == '__main__':
-    #a = GRU_NP()
+    a = GRU_NP()
     b = GRU_MKL()
 
