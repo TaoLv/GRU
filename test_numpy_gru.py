@@ -10,7 +10,7 @@ def sigmoid(x):
     return 1. / (1. + np.exp(-x))
 
 
-x = np.random.rand(32, 80, 620).astype(np.float64)
+x = np.random.rand(100, 80, 620).astype(np.float64)
 w_x = np.random.rand(3*620, 1000).astype(np.float64) - np.random.rand(3* 620, 1000).astype(np.float64)
 w_xh = w_x[0:620, :]
 w_xz = w_x[620: 2*620, :]
@@ -31,10 +31,10 @@ hid = np.zeros((80, 1000), np.float64)
 
 def GRU_NP():
     global x, w_xr, w_xz, w_xh, w_hr, w_hz, w_hh, b_r, b_z, b_h, hid
-    for i in range(32):
-        x_r = np.dot(x[i], w_xr) + b_r
-        x_z = np.dot(x[i], w_xz) + b_z
-        x_h = np.dot(x[i], w_xh) + b_h
+    for i in range(100):
+        x_r = np.dot(x[i], w_xr)
+        x_z = np.dot(x[i], w_xz)
+        x_h = np.dot(x[i], w_xh)
         
         t = x_z + np.dot(hid, w_hz)
         z_t = sigmoid(t)
@@ -59,14 +59,14 @@ def GRU_MKL():
     W_h = T.dmatrix('W_h')
     B = T.dvector('b')
 
-    Z = GRU(hid=1000, return_sequences=True)(X, W_x, W_h, B)
-    f = theano.function([X, W_x, W_h, B], Z)
+    Z = GRU(hid=1000, return_sequences=True)(X, W_x, W_h)
+    f = theano.function([X, W_x, W_h], Z)
     #theano.printing.pydotprint(f, outfile='gru.png', var_with_name_simple=True)
 
     # for i in range(100):
-    o = f(x, w_x, w_h, b)
+    o = f(x, w_x, w_h)
     
-    return o[31]
+    return o[99]
 
 
 if __name__ == '__main__':
