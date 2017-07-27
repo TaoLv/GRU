@@ -3,11 +3,14 @@ import theano
 from theano import tensor, gof
 from theano.tensor.blas import ldflags
 
+from mkl_gru_backward import GRUGradInputs, GRUGradWeights
+from mkl_gru_gradients import GRUGradients
+
 
 class GRU(gof.Op):
     __props__ = ('hid', 'step', 'dim', 'return_sequences')
 
-    def __init__(self, hid, step=None, dim=None, return_sequences=False):
+    def __init__(self, hid, step=None, dim=None, return_sequences=True):
         self.hid = hid
         self.step = step
         self.dim = dim
@@ -15,10 +18,12 @@ class GRU(gof.Op):
         super(GRU, self).__init__()
 
     def make_node(self, *inputs):
+        """
+        inputs: X, Wx, Wh, hid_init, bias. bias is optional.
 
-        if len(inputs) is 3:
-            inp = list(map(tensor.as_tensor_variable, inputs))
-        elif len(inputs) is 4:
+        """
+
+        if len(inputs) in (4, 5):
             inp = list(map(tensor.as_tensor_variable, inputs))
         else:
             raise ValueError('GRU: number of parameter is wrong.')
@@ -26,12 +31,16 @@ class GRU(gof.Op):
         assert inp[0].ndim is 3
         assert inp[1].ndim is 2
         assert inp[2].ndim is 2
+        assert inp[3].ndim is 2
 
         if self.return_sequences:
+            out = [inp[0].type()]
+        else:
             bcast = [inp[0].type.broadcastable[1], inp[0].type.broadcastable[2]]
             out = [tensor.tensor(dtype=inp[0].type.dtype, broadcastable=bcast)]
-        else:
-            out = [inp[0].type()]
+
+        # output workspace (hid, zt, rt, hcan, hht)
+        out = out + [inp[0].type(), inp[0].type(), inp[0].type(), inp[0].type()]
 
         return gof.Apply(self, inp, out)
 
@@ -142,16 +151,16 @@ class GRU(gof.Op):
         return ccode
 
     def c_code(self, node, name, inputs, outputs, sub):
-        if len(inputs) is 3:
+        if len(inputs) is 4:
             with_bias = 0
-            X, W_x, W_h = inputs
-        elif len(inputs) is 4:
+            X, W_x, W_h, hid_init = inputs
+        elif len(inputs) is 5:
             with_bias = 1
-            X, W_x, W_h, b = inputs
+            X, W_x, W_h, hid_init, b = inputs
         else:
-            raise TypeError('GRU: too much arguments')
+            raise TypeError('GRU: wrong number of arguments, expecting for 4 or 5')
 
-        z, = outputs
+        z, zt, rt, hcan, hht = outputs
         hid = self.hid
         if self.return_sequences:
             return_sequences = 1
@@ -169,18 +178,19 @@ class GRU(gof.Op):
                             % (node.inputs[0].type.dtype))
 
         ccode = """
-            time_step = PyArray_DIMS(%(X)s)[0];
+            time_step  = PyArray_DIMS(%(X)s)[0];
             batch_size = PyArray_DIMS(%(X)s)[1];
             embed_dims = PyArray_DIMS(%(X)s)[2];
 
             npy_intp dims[3] = {0, 0, 0};
-            %(d)s* x_ptr = NULL;
-            %(d)s* w_x_ptr = NULL;
-            %(d)s* w_h_ptr = NULL;
-            %(d)s* b_ptr = NULL;   // If no bias input, keep it with NULL.
+            %(d)s* x_ptr     = NULL;
+            %(d)s* w_x_ptr   = NULL;
+            %(d)s* w_h_ptr   = NULL;
+            %(d)s* b_ptr     = NULL;   // If no bias input, keep it with NULL.
+            %(d)s* hinit_ptr = NULL;
 
-            vmlSetMode(vmlGetMode() & 0xFFFFFFF0 | VML_HA);
-           
+            // vmlSetMode(vmlGetMode() & 0xFFFFFFF0 | VML_HA);
+
             if (A == NULL) {
                 A = (%(d)s**)mkl_malloc(3 * time_step * sizeof (%(d)s*), 64);
             }
@@ -193,9 +203,14 @@ class GRU(gof.Op):
                 C = (%(d)s**)mkl_malloc(3 * time_step * sizeof (%(d)s*), 64);
             }
 
-            PyArrayObject* x_src = NULL;
+            PyArrayObject* x_src     = NULL;
+            PyArrayObject* w_x_src   = NULL;
+            PyArrayObject* w_h_src   = NULL;
+            PyArrayObject* b_src     = NULL;   // If no bias input, keep it with NULL
+            PyArrayObject* hinit_src = NULL;
+
             if (!PyArray_IS_C_CONTIGUOUS(%(X)s)) {
-                printf(\"Warning: Need convert X to C-Contiguous\\n\");
+                printf(\"Warning: GRU need convert X to C-Contiguous\\n\");
                 x_src = (PyArrayObject*)PyArray_ContiguousFromAny((PyObject*)%(X)s,
                                             PyArray_TYPE(%(X)s),
                                             PyArray_NDIM(%(X)s),
@@ -215,9 +230,8 @@ class GRU(gof.Op):
                 goto gru_fail;
             }
 
-            PyArrayObject* w_x_src = NULL;
             if (!PyArray_IS_C_CONTIGUOUS(%(W_x)s)) {
-                printf(\"Warning: Need convert W_x to C-Contiguous\\n\");
+                printf(\"Warning: GRU need convert W_x to C-Contiguous\\n\");
                 w_x_src = (PyArrayObject*)PyArray_ContiguousFromAny((PyObject*)%(W_x)s,
                                             PyArray_TYPE(%(W_x)s),
                                             PyArray_NDIM(%(W_x)s),
@@ -231,9 +245,8 @@ class GRU(gof.Op):
                 w_x_ptr = (%(d)s*) PyArray_DATA(%(W_x)s);
             }
 
-            PyArrayObject* w_h_src = NULL;
             if (!PyArray_IS_C_CONTIGUOUS(%(W_h)s)) {
-                printf(\"Warning: Need convert W_h to C-Contiguous\\n\");
+                printf(\"Warning: GRU need convert W_h to C-Contiguous\\n\");
                 w_h_src = (PyArrayObject*)PyArray_ContiguousFromAny((PyObject*)%(W_h)s,
                                             PyArray_TYPE(%(W_h)s),
                                             PyArray_NDIM(%(W_h)s),
@@ -247,12 +260,26 @@ class GRU(gof.Op):
                 w_h_ptr = (%(d)s*) PyArray_DATA(%(W_h)s);
             }
 
+            if (!PyArray_IS_C_CONTIGUOUS(%(hid_init)s)) {
+                printf(\"Warning: GRU need convert hid_init to C-Contiguous\\n\");
+                hinit_src = (PyArrayObject*)PyArray_ContiguousFromAny((PyObject*)%(hid_init)s,
+                                            PyArray_TYPE(%(hid_init)s),
+                                            PyArray_NDIM(%(hid_init)s),
+                                            PyArray_NDIM(%(hid_init)s));
+                if (!hinit_src) {
+                    PyErr_SetString(PyExc_RuntimeError, \"GRU: fail to cast hid_init to contiguous array\");
+                    goto gru_fail;
+                }
+                hinit_ptr = (%(d)s*) PyArray_DATA(hinit_src);
+            } else {
+                hinit_ptr = (%(d)s*) PyArray_DATA(%(hid_init)s);
+            }
+
             // x_hzr has shape (3 * time_step, batch_size, %(hid)s)
             if (NULL == x_hzr) {
                 x_hzr = (%(d)s*)mkl_malloc(time_step * 3 * batch_size * %(hid)s * sizeof (%(d)s), 64);
             }
 
-            PyArrayObject* b_src = NULL; // If no bias input, keep it with NULL
         """ % locals()
 
         if with_bias:
@@ -295,6 +322,7 @@ class GRU(gof.Op):
             m[0] = batch_size;
             k[0] = embed_dims;
             n[0] = %(hid)s;
+
             #pragma omp parallel for
             for (int i = 0; i < time_step; i++) {
                 A[i] = x_ptr + i * m[0] * k[0];
@@ -321,7 +349,7 @@ class GRU(gof.Op):
                                       alpha, A, k, B, n, beta, C, n, 1, size_per_grp);
 
             //// step 2. construct output
-            if (%(z)s == NULL) {
+            if ( NULL == %(z)s) {
                 if (%(return_sequences)s) {
                     dims[0] = time_step;
                     dims[1] = batch_size;
@@ -339,11 +367,40 @@ class GRU(gof.Op):
                 goto gru_fail;
             }
 
+            // zt, rt, hcan, hht are workspaces for backward computation
+            if (NULL == %(zt)s) {
+                dims[0] = time_step;
+                dims[1] = batch_size;
+                dims[2] = %(hid)s;
+                %(zt)s = (PyArrayObject*) PyArray_ZEROS(3, dims, PyArray_TYPE(%(X)s), 0);
+            }
+
+            if (NULL == %(rt)s) {
+                dims[0] = time_step;
+                dims[1] = batch_size;
+                dims[2] = %(hid)s;
+                %(rt)s = (PyArrayObject*) PyArray_ZEROS(3, dims, PyArray_TYPE(%(X)s), 0);
+            }
+
+            if (NULL == %(hcan)s) {
+                dims[0] = time_step;
+                dims[1] = batch_size;
+                dims[2] = %(hid)s;
+                %(hcan)s = (PyArrayObject*) PyArray_ZEROS(3, dims, PyArray_TYPE(%(X)s), 0);
+            }
+
+            if (NULL == %(hht)s) {
+                dims[0] = time_step;
+                dims[1] = batch_size;
+                dims[2] = %(hid)s;
+                %(hht)s = (PyArrayObject*) PyArray_ZEROS(3, dims, PyArray_TYPE(%(X)s), 0);
+            }
+
             //// step 3: step on time_step
             // loop on step
-            A[0] = (%(d)s*)PyArray_DATA(%(z)s);
-            A[1] = A[0];
-            A[2] = A[0];
+            A[0] = hinit_ptr;
+            A[1] = hinit_ptr;
+            A[2] = hinit_ptr;
             B[0] = (%(d)s*)PyArray_DATA(%(W_h)s) + %(hid)s * %(hid)s;     // w_hz
             B[1] = (%(d)s*)PyArray_DATA(%(W_h)s) + 2 * %(hid)s * %(hid)s; // w_hr
             B[2] = (%(d)s*)PyArray_DATA(%(W_h)s);                         // w_hh
@@ -359,11 +416,16 @@ class GRU(gof.Op):
             beta[0]         = 1.0;
             size_per_grp[0] = 2;
             for (int i = 0; i < time_step; i++) {
+                %(d)s* zt_ptr   = (%(d)s*) PyArray_DATA(%(zt)s)   + i * m[0] * n[0];
+                %(d)s* rt_ptr   = (%(d)s*) PyArray_DATA(%(rt)s)   + i * m[0] * n[0];
+                %(d)s* hcan_ptr = (%(d)s*) PyArray_DATA(%(hcan)s) + i * m[0] * n[0];
+                %(d)s* hht_ptr  = (%(d)s*) PyArray_DATA(%(hht)s)  + i * m[0] * n[0];
+
                 //z_t, r_t
                 C[0] = x_hzr + (i + time_step) * m[0] * n[0];
                 C[1] = x_hzr + (i + 2 * time_step) * m[0] * n[0];
                 C[2] = temp;
-                
+
                 // do below two function with batch-gemm first, then sigmoid respectively
                 // z_t = K.sigmoid(x_z + K.dot(h_tm1, self.W_hz) + self.b_z)
                 // r_t = K.sigmoid(x_r + K.dot(h_tm1, self.W_hr) + self.b_r)
@@ -372,47 +434,58 @@ class GRU(gof.Op):
                                           alpha, A, k, B, n, beta, C, n, 1, size_per_grp);
 
                 // sigmoid(C[0]), sigmoid(C[1])
+                // v%(dtype)sExp(m[0] * n[0], C[0], C[0]);
+                // v%(dtype)sExp(m[0] * n[0], C[1], C[1]);
+                size_t mn = m[0] * n[0];
                 int t = 0;
-
-                v%(dtype)sExp(m[0] * n[0], C[0], C[0]);
-                v%(dtype)sExp(m[0] * n[0], C[1], C[1]);
-                int mn = m[0] * n[0];
                 #pragma omp parallel for
                 for (t = 0; t < mn; t++) {
-                    C[0][t] = (%(d)s)((double)(C[0][t]) / ((double)1.0 + (double)(C[0][t])));
-                    C[1][t] = (%(d)s)((double)(C[1][t]) / ((double)1.0 + (double)(C[1][t])));
+                    double exp_zt = exp((double)(C[0][t]));
+                    double exp_rt = exp((double)(C[1][t]));
+
+                    // Save rt and zt for workspace
+                    zt_ptr[t] = (%(d)s)(exp_zt / ((double)1.0 + exp_zt));
+                    rt_ptr[t] = (%(d)s)(exp_rt / ((double)1.0 + exp_rt));
                 }
 
-                // GEMM -> Mul -> Add -> tanh, can_h_t is stored in temp
+                // GEMM -> Mul -> Add -> tanh
                 // can_h_t = K.tanh(x_h + r_t * K.dot(h_tm1, self.W_hh) + self.b_h)
                 cblas_%(dtype)sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m[0], n[0], k[0],
                                     1.0, A[2], k[0], B[2], n[0], 0.0, C[2], n[0]);
 
-                v%(dtype)sMul(batch_size * %(hid)s, C[1], temp, temp);
-                v%(dtype)sAdd(batch_size * %(hid)s, x_hzr + i * m[0] * n[0], temp, temp);
+                // Save hht
+                memcpy((void*) hht_ptr, (void*)(C[2]), m[0] * n[0] * sizeof (%(d)s));
 
-                // tanh(temp)
-                v%(dtype)sTanh(m[0] * n[0], temp, temp);
+                // v%(dtype)sMul(batch_size * %(hid)s, rt_ptr, temp, temp);
+                // v%(dtype)sAdd(batch_size * %(hid)s, x_hzr + i * m[0] * n[0], temp, temp);
+
+                // tanh(temp), save hcan(t)
+                // v%(dtype)sTanh(m[0] * n[0], temp, hcan_ptr);
+                #pragma omp parallel for
+                for (t = 0; t < mn; t++) {
+                    double foo = (double)(rt_ptr[t]) * (double)(temp[t]) + (double)((x_hzr + i * mn)[t]);
+                    // foo = (double)(temp[t]) + foo;
+                    hcan_ptr[t] = tanh(foo);
+                }
 
                 // h_t = (1. - z_t) * h_tm1 + z_t * can_h_t
                 mn = batch_size * %(hid)s;
+                %(d)s* z_ptr = NULL;
+                if (%(return_sequences)s) {
+                    z_ptr = (%(d)s*) PyArray_DATA(%(z)s) + i * batch_size * %(hid)s;
+                } else {
+                    z_ptr = (%(d)s*) PyArray_DATA(%(z)s);
+                }
+
+                // update
                 #pragma omp parallel for num_threads(16)
                 for (int j = 0; j < mn; j++) {
-                    A[0][j] = (%(d)s)( ((double)1.0 - (double)(C[0][j])) * (double)(A[0][j]) + (double)(C[0][j]) * (double)(temp[j]));
+                    z_ptr[j] = (%(d)s)( ((double)1.0 - (double)(zt_ptr[j])) * (double)(A[0][j]) + (double)(zt_ptr[j]) * (double)(hcan_ptr[j]));
                 }
 
-                // set output data
-                if (%(return_sequences)s && (i < time_step - 1)) {
-                    %(d)s* ptr = (%(d)s*)PyArray_DATA(%(z)s) + (i + 1) * batch_size * %(hid)s;
-                    memcpy((char*)ptr,
-                           (char*)(A[0]),
-                           batch_size * %(hid)s * sizeof (%(d)s));
-
-                    A[0] = ptr;
-                    A[1] = A[0];
-                    A[2] = A[0];
-                }
-                printf(\"%%.9f, %%.9f, %%.9f\\n\", A[0][0], A[0][1000], A[0][batch_size * %(hid)s -1]);
+                A[0] = z_ptr;
+                A[1] = A[0];
+                A[2] = A[0];
             }
 
             gru_fail:
@@ -420,11 +493,40 @@ class GRU(gof.Op):
             Py_XDECREF(w_x_src);
             Py_XDECREF(w_h_src);
             Py_XDECREF(b_src);
+            Py_XDECREF(hinit_src);
         """ % locals()
         return ccode
 
     def grad(self, inp, grads):
-        raise NotImplemented('GRU: grad()')
+        X, Wx, Wh, hid_init = inp[0:4]
+        gz = grads[0]
+
+        hid, zt, rt, hcan, hht = GRU(hid=self.hid,
+                                     step=self.step,
+                                     dim=self.dim,
+                                     return_sequences=self.return_sequences)(*inp)
+        """
+        gradi = GRUGradInputs(hid=self.hid,
+                              step=self.step,
+                              dim=self.dim,
+                              return_sequences=self.return_sequences)(Wx, Wh, hid, zt, rt, hcan, hht, gz)
+
+        gradwx, gradwh = GRUGradWeights(hid=self.hid,
+                                        step=self.step,
+                                        dim=self.dim,
+                                        return_sequences=self.return_sequences)(X, Wh, hid, zt, rt, hcan, hht, gz)
+        """
+        
+        GRUGrad = GRUGradients(hid=self.hid,
+                               step=self.step,
+                               dim=self.dim,
+                               return_sequences=self.return_sequences)
+
+        gradi, gradwx, gradwh, gradhinit = GRUGrad(X, Wx, Wh, hid, hid_init, zt, rt, hcan, hht, gz) 
+        if len(inp) is 4:
+            return [gradi, gradwx, gradwh, gradhinit]
+        else:
+            return [gradi, gradwx, gradwh, gradhinit, gradi]
 
     def c_code_cache_version(self):
         return (1, 0, 0)

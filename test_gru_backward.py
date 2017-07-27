@@ -1,5 +1,4 @@
 
-
 import time
 import theano
 import numpy as np
@@ -23,8 +22,7 @@ B_h = T.dvector('B_h')
 B_z = T.dvector('B_z')
 B_r = T.dvector('B_r')
 
-
-hid = T.dmatrix('W_hh')
+hid = T.dmatrix('hid')
 
 np.random.seed(123)
 
@@ -36,21 +34,25 @@ def step(x_h, x_z, x_r, h_tm1):
     can_h_t = tanh(x_h + r_t * T.dot(h_tm1, W_hh))
 
     h_t = (1. - z_t) * h_tm1 + z_t * can_h_t
-    return h_t, z_t, r_t
+    return h_t
 
 def GRU_theano():
-    global X, W_xr, W_xz, W_xh, hid
+    global X, W_xr, W_xz, W_xh, hid, W_hh, Whz, Whr
     X_r = T.dot(X, W_xr)
     X_z = T.dot(X, W_xz)
     X_h = T.dot(X, W_xh)
 
     fn = lambda x_h, x_z, x_r, h_tm1: step(x_h, x_z, x_r, h_tm1)
 
-    result, updates = theano.scan(fn, sequences=[X_h, X_z, X_r], outputs_info=[hid, None, None], name='test_theano_gru_scan')
-    f = theano.function([X, W_xh, W_xz, W_xr, W_hh, W_hz, W_hr, hid], result, updates=updates)
+    result, updates = theano.scan(fn, sequences=[X_h, X_z, X_r], outputs_info=hid, name='test_theano_gru_scan')
+
+    loss = result.sum()
+    gx, gwxh, gwxz, gwxr, gwhh, gwhz, gwhr, ghinit = theano.grad(loss, [X, W_xh, W_xz, W_xr, W_hh, W_hz, W_hr, hid])
+
+    f = theano.function([X, W_xh, W_xz, W_xr, W_hh, W_hz, W_hr, hid],
+                        [gx, gwxh, gwxz, gwxr, gwhh, gwhz, gwhr, ghinit], updates=updates)
 
     return f
-
 
 
 def GRU_MKL():
@@ -59,11 +61,14 @@ def GRU_MKL():
     W_x = T.dmatrix('W_x')
     W_h = T.dmatrix('W_h')
     B = T.dvector('b')
-    Hid = T.dmatrix('Hid_init')
+    Hid_init = T.dmatrix('hid_init')
 
-    Z = GRU(hid=1000, return_sequences=True)(X, W_x, W_h, Hid)
-    f = theano.function([X, W_x, W_h, Hid], Z)
-    theano.printing.pydotprint(f, outfile='gru.png', var_with_name_simple=True)
+    Z = GRU(hid=1000, return_sequences=True)(X, W_x, W_h, Hid_init)
+
+    loss = Z[0].sum()
+    gi, gwx, gwh, ghinit = theano.grad(loss, [X, W_x, W_h, Hid_init])
+    f = theano.function([X, W_x, W_h, Hid_init], [gi, gwx, gwh, ghinit])
+    theano.printing.pydotprint(f, outfile='gru_backward.png', var_with_name_simple=True)
 
     return f
 
@@ -72,7 +77,7 @@ if __name__ == '__main__':
     f_theano = GRU_theano()
     f_mkl = GRU_MKL()
 
-    v_x = np.random.rand(10, 80, 620).astype(np.float64)
+    v_x = np.random.rand(2, 80, 620).astype(np.float64)
     v_w = np.random.rand(3*620, 1000).astype(np.float64) - np.random.rand(3*620, 1000).astype(np.float64) 
     v_w_xh = v_w[0:620, :]
     v_w_xz = v_w[620:1240, :]
@@ -87,29 +92,14 @@ if __name__ == '__main__':
     v_hid = np.zeros((80, 1000), np.float64)
     
     tic = time.time()
-    out = f_theano(v_x, v_w_xh, v_w_xz, v_w_xr, v_w_hh, v_w_hz, v_w_hr, v_hid)
+    for i in range(100):
+        out = f_theano(v_x, v_w_xh, v_w_xz, v_w_xr, v_w_hh, v_w_hz, v_w_hr, v_hid)
 
     toc = time.time()
     print('time: %.6f' %(toc - tic))
 
     tic = time.time()
-    foo, zt, rt, hcan, hht = f_mkl(v_x, v_w, v_wh, v_hid)
+    for i in range(100):
+        foo = f_mkl(v_x, v_w, v_wh, v_hid)
     toc = time.time()
     print('time: %.6f' %(toc - tic))
-
-    print(out[0].shape, foo.shape)
-    print(out[0][-1].sum(), foo[-1].sum())
-    print((foo[-1]-out[0][-1]).max())
-    p, q = np.where((foo[-1]-out[0][-1])==(foo[-1] - out[0][-1]).max())
-    print(out[0][-1][ p, q])
-    # assert np.allclose(hht, np.dot(v_hid, v_w_hh))
-
-    # e = np.exp(np.dot(v_x[0], v_w_xz) + np.dot(v_hid, v_w_hz))
-    # zzzz = e / (1.0 + e)
-    # assert np.allclose(zt, zzzz)
-    print(zt.sum())
-    print(out[1].sum())
-
-    print(rt.sum())
-    print(out[2].sum())
-

@@ -10,7 +10,7 @@ def sigmoid(x):
     return 1. / (1. + np.exp(-x))
 
 
-x = np.random.rand(100, 80, 620).astype(np.float64)
+x = np.random.rand(1, 80, 620).astype(np.float64)
 w_x = np.random.rand(3*620, 1000).astype(np.float64) - np.random.rand(3* 620, 1000).astype(np.float64)
 w_xh = w_x[0:620, :]
 w_xz = w_x[620: 2*620, :]
@@ -31,7 +31,7 @@ hid = np.zeros((80, 1000), np.float64)
 
 def GRU_NP():
     global x, w_xr, w_xz, w_xh, w_hr, w_hz, w_hh, b_r, b_z, b_h, hid
-    for i in range(100):
+    for i in range(x.shape[0]):
         x_r = np.dot(x[i], w_xr)
         x_z = np.dot(x[i], w_xz)
         x_h = np.dot(x[i], w_xh)
@@ -47,7 +47,7 @@ def GRU_NP():
         can_h_t = np.tanh(t)
 
         hid = (1. - z_t) * hid + z_t * can_h_t
-        print("%.9f, %.9f, %.9f" %(hid[0,0], hid[1, 0], hid[-1,-1]))
+        # print("%.9f, %.9f, %.9f" %(hid[0,0], hid[1, 0], hid[-1,-1]))
     return hid
 
 
@@ -64,12 +64,16 @@ def GRU_MKL():
     #theano.printing.pydotprint(f, outfile='gru.png', var_with_name_simple=True)
 
     # for i in range(100):
-    o = f(x, w_x, w_h)
+    o, zt, rt, hcan, hht = f(x, w_x, w_h)
     
-    return o[99]
+    return o[-1]
 
 
 if __name__ == '__main__':
     a = GRU_NP()
     b = GRU_MKL()
+
+    print(a.sum(), b.sum())
+    print((b-a).max())
+
 
