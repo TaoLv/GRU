@@ -28,6 +28,11 @@ class GRU(gof.Op):
         else:
             raise ValueError('GRU: number of parameter is wrong.')
 
+        if len(inputs) == 5:
+            self.bias = True
+        else:
+            self.bias = False
+
         assert inp[0].ndim is 3
         assert inp[1].ndim is 2
         assert inp[2].ndim is 2
@@ -516,17 +521,27 @@ class GRU(gof.Op):
                                         dim=self.dim,
                                         return_sequences=self.return_sequences)(X, Wh, hid, zt, rt, hcan, hht, gz)
         """
-        
-        GRUGrad = GRUGradients(hid=self.hid,
-                               step=self.step,
-                               dim=self.dim,
-                               return_sequences=self.return_sequences)
+       
+        if self.bias:
+            GRUGrad = GRUGradients(hid=self.hid,
+                                   step=self.step,
+                                   dim=self.dim,
+                                   return_sequences=self.return_sequences,
+                                   bias=True)
+            gradi, gradwx, gradwh, gradhinit, gradbias = GRUGrad(X, Wx, Wh, hid, hid_init, zt, rt, hcan, hht, gz)
+        else:
+            GRUGrad = GRUGradients(hid=self.hid,
+                                   step=self.step,
+                                   dim=self.dim,
+                                   return_sequences=self.return_sequences,
+                                   bias=False)
+            gradi, gradwx, gradwh, gradhinit = GRUGrad(X, Wx, Wh, hid, hid_init, zt, rt, hcan, hht, gz)
+            gradbias = None
 
-        gradi, gradwx, gradwh, gradhinit = GRUGrad(X, Wx, Wh, hid, hid_init, zt, rt, hcan, hht, gz) 
         if len(inp) is 4:
             return [gradi, gradwx, gradwh, gradhinit]
         else:
-            return [gradi, gradwx, gradwh, gradhinit, gradi]
+            return [gradi, gradwx, gradwh, gradhinit, gradbias]
 
     def c_code_cache_version(self):
         return (1, 0, 0)

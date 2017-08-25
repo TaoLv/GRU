@@ -1,17 +1,19 @@
 
 import theano
 from theano import tensor, gof
+from theano.tensor import TensorType
 from theano.tensor.blas import ldflags
 
 
 class GRUGradients(gof.Op):
     __props__ = ('hid', 'step', 'dim', 'return_sequences')
 
-    def __init__(self, hid, step=None, dim=None, return_sequences=False):
+    def __init__(self, hid, step=None, dim=None, return_sequences=False, bias=False):
         self.hid = hid
         self.step = step
         self.dim = dim
         self.return_sequences = return_sequences
+        self.bias = bias
         super(GRUGradients, self).__init__()
 
     def make_node(self, X, Wx, Wh, hid, hid_init, zt, rt, hcan, hht, grads):
@@ -56,6 +58,8 @@ class GRUGradients(gof.Op):
         assert inp[8].type.ndim is 3
 
         out = [X.type(), Wx.type(), Wh.type(), hid_init.type()]
+        if self.bias:
+            out = out + [TensorType(dtype=Wx.type.dtype, broadcastable=(False,))()]
         return gof.Apply(self, inp, out)
 
     def c_headers(self):
@@ -179,7 +183,13 @@ class GRUGradients(gof.Op):
 
     def c_code(self, node, name, inputs, outputs, sub):
         X, Wx, Wh, hid_state, hid_init, zt, rt, hcan, hht, gz = inputs
-        gi, gwx, gwh, ghinit = outputs
+
+        if self.bias:
+            with_bias = 1
+            gi, gwx, gwh, ghinit, gb = outputs
+        else:
+            with_bias = 0
+            gi, gwx, gwh, ghinit = outputs
 
         hid = self.hid
         if self.return_sequences:
@@ -342,6 +352,32 @@ class GRUGradients(gof.Op):
                 PyErr_SetString(PyExc_RuntimeError, \"GRUGradients: create output array failed\");
                 goto gru_backward_fail;
             }
+            """ % locals()
+
+        if self.bias:
+            ccode += """
+                if (%(gb)s == NULL || PyArray_NDIM(%(gb)s) != 1 ||
+                    PyArray_DIMS(%(gb)s)[0] != 3 * hid_dims) {
+                    Py_XDECREF(%(gb)s);
+
+                    dims[0] = 3 * hid_dims;
+                    %(gb)s = (PyArrayObject*) PyArray_ZEROS(1, dims, PyArray_TYPE(%(Wx)s), 0);
+                }
+
+                if (NULL == %(gb)s) {
+                    PyErr_SetString(PyExc_RuntimeError, \"GRUGradients: create output array for gradient bias fasiled\");
+                    goto gru_backward_fail;
+                }
+
+                %(d)s* gb_ptr = (%(d)s*) PyArray_DATA(%(gb)s);
+                """ % locals()
+        else:
+            ccode += """
+                // no gradient bias for this apply..
+                %(d)s* gb_ptr = NULL;
+                """ % locals()
+
+        ccode += """
 
             if (NULL == d0) {
                 d0 = (%(d)s*) mkl_malloc(batch_size * hid_dims * sizeof (%(d)s), 64);
@@ -522,7 +558,18 @@ class GRUGradients(gof.Op):
                 cblas_%(dtype)sgemm_batch(CblasRowMajor, transA, transB, m, n, k,
                                           alpha, A, lda, B, ldb, beta, C, ldc, 2, size_per_grp);
 
+                // gb, reduction to one line
+                if (gb_ptr) {
+                    for (int t = 0; t < batch_size; t++) {
+                        v%(dtype)sAdd(hid_dims, d2 + t * hid_dims, gb_ptr, gb_ptr); // for bh
+                        v%(dtype)sAdd(hid_dims, d14 + t * hid_dims, gb_ptr + hid_dims, gb_ptr + hid_dims); // for bz
+                        v%(dtype)sAdd(hid_dims, d11 + t * hid_dims, gb_ptr + 2 * hid_dims, gb_ptr + 2 * hid_dims); // for br
+                    }
+                }
             }
+
+            // dhinit is dhnext(0)
+            memcpy ((void*)PyArray_DATA(%(ghinit)s), (void*)dhnext, batch_size * hid_dims * sizeof (%(d)s));
 
             gru_backward_fail:
             Py_XDECREF(x_src);
