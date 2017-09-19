@@ -5,6 +5,8 @@ import numpy as np
 import mkl_gru
 from mkl_gru import GRU
 
+np.random.seed(12345)
+
 
 def sigmoid(x):
     return 1. / (1. + np.exp(-x))
@@ -21,16 +23,11 @@ w_hh = w_h[0:1000, :]
 w_hz = w_h[1000:2000, :]
 w_hr = w_h[2000:, :]
 
-b = np.random.rand(3*1000).astype(np.float64) - np.random.rand(3*1000).astype(np.float64)
-b_h = b[0:1000]
-b_z = b[1000:2000]
-b_r = b[2000:]
-
 hid = np.zeros((80, 1000), np.float64)
 
 
 def GRU_NP():
-    global x, w_xr, w_xz, w_xh, w_hr, w_hz, w_hh, b_r, b_z, b_h, hid
+    global x, w_xr, w_xz, w_xh, w_hr, w_hz, w_hh, hid
     for i in range(x.shape[0]):
         x_r = np.dot(x[i], w_xr)
         x_z = np.dot(x[i], w_xz)
@@ -47,33 +44,28 @@ def GRU_NP():
         can_h_t = np.tanh(t)
 
         hid = (1. - z_t) * hid + z_t * can_h_t
-        # print("%.9f, %.9f, %.9f" %(hid[0,0], hid[1, 0], hid[-1,-1]))
     return hid
 
 
 def GRU_MKL():
-    global x, w_x, w_h, b
+    global x, w_x, w_h, hid
+    # avoid hid is modified by numpy function
+    hid = np.zeros((80, 1000), np.float64)
     
     X = T.dtensor3('X')
     W_x = T.dmatrix('W_x')
     W_h = T.dmatrix('W_h')
-    B = T.dvector('b')
+    Hid = T.dmatrix('Hid')
 
-    Z = GRU(hid=1000, return_sequences=True)(X, W_x, W_h)
-    f = theano.function([X, W_x, W_h], Z)
-    #theano.printing.pydotprint(f, outfile='gru.png', var_with_name_simple=True)
+    Z = GRU(hid=1000, return_sequences=True, max_len=100)(X, W_x, W_h, Hid)
+    f = theano.function([X, W_x, W_h, Hid], Z)
 
-    # for i in range(100):
-    o, zt, rt, hcan, hht = f(x, w_x, w_h)
-    
-    return o[-1]
+    o, zt, rt, hcan, hht = f(x, w_x, w_h, hid)
+    return o
 
 
 if __name__ == '__main__':
     a = GRU_NP()
     b = GRU_MKL()
 
-    print(a.sum(), b.sum())
-    print((b-a).max())
-
-
+    assert np.allclose (a, b[-1])

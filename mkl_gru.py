@@ -3,18 +3,18 @@ import theano
 from theano import tensor, gof
 from theano.tensor.blas import ldflags
 
-from mkl_gru_backward import GRUGradInputs, GRUGradWeights
 from mkl_gru_gradients import GRUGradients
 
 
 class GRU(gof.Op):
-    __props__ = ('hid', 'step', 'dim', 'return_sequences')
+    __props__ = ('hid', 'step', 'dim', 'return_sequences', 'max_len')
 
-    def __init__(self, hid, step=None, dim=None, return_sequences=True):
+    def __init__(self, hid, step=None, dim=None, return_sequences=True, max_len=None):
         self.hid = hid
         self.step = step
         self.dim = dim
         self.return_sequences = return_sequences
+        self.max_len=max_len
         super(GRU, self).__init__()
 
     def make_node(self, *inputs):
@@ -22,7 +22,6 @@ class GRU(gof.Op):
         inputs: X, Wx, Wh, hid_init, bias. bias is optional.
 
         """
-
         if len(inputs) in (4, 5):
             inp = list(map(tensor.as_tensor_variable, inputs))
         else:
@@ -30,6 +29,7 @@ class GRU(gof.Op):
 
         if len(inputs) == 5:
             self.bias = True
+            assert inp[-1].ndim is 1
         else:
             self.bias = False
 
@@ -88,6 +88,7 @@ class GRU(gof.Op):
         size_t time_step;
         size_t batch_size;
         size_t embed_dims;
+        size_t max_len;
 
         %(dtype)s* temp;
         %(dtype)s* x_hzr;
@@ -120,6 +121,7 @@ class GRU(gof.Op):
         time_step = 0;
         batch_size = 0;
         embed_dims = 0;
+        max_len = 0;
 
         temp = NULL;
         x_hzr = NULL;
@@ -129,6 +131,7 @@ class GRU(gof.Op):
 
     def c_cleanup_code_struct(self, node, name):
         ccode = """
+        // printf("c_clean_code_struct\\n");
         if (A) {
             mkl_free (A);
             A = NULL;
@@ -172,6 +175,11 @@ class GRU(gof.Op):
         else:
             return_sequences = 0
 
+        if self.max_len:
+            max_len = int(self.max_len)
+        else:
+            max_len = 0
+
         if node.inputs[0].type.dtype == 'float32':
             dtype = 's'
             d = 'float'
@@ -191,21 +199,60 @@ class GRU(gof.Op):
             %(d)s* x_ptr     = NULL;
             %(d)s* w_x_ptr   = NULL;
             %(d)s* w_h_ptr   = NULL;
-            %(d)s* b_ptr     = NULL;   // If no bias input, keep it with NULL.
+            %(d)s* b_ptr     = NULL;   // If no bias input, keep b_ptr as NULL.
             %(d)s* hinit_ptr = NULL;
+
+            // if max_len is given, and it's small than time_step,
+            // a runtime error will be threw out.
+            if (%(max_len)s && %(max_len)s < time_step) {
+                PyErr_Format(PyExc_RuntimeError,
+                             \"GRU: length of input sequence is too long: %%d,\"
+                             \" max length is %%d\",
+                             time_step, %(max_len)s);
+                goto gru_fail;
+            }
+
+            if (%(max_len)s) {
+                max_len = %(max_len)s;
+            }
 
             // vmlSetMode(vmlGetMode() & 0xFFFFFFF0 | VML_HA);
 
-            if (A == NULL) {
-                A = (%(d)s**)mkl_malloc(3 * time_step * sizeof (%(d)s*), 64);
+            // if max_len is not input as a constraint, we need to
+            // recreate buffers and output objects if time_step increased
+            // among iterations. Otherwise, we will reuse those buffers
+            // and output objects.
+            if (max_len < time_step) {
+                printf(\"GRU: no max_len constraint, time_step increased: %%d -> %%d\\n\", max_len, time_step);
+                mkl_free(A);            A = NULL;
+                mkl_free(B);            B = NULL;
+                mkl_free(C);            C = NULL;
+                mkl_free(x_hzr);        x_hzr = NULL;
+
+                Py_XDECREF(%(zt)s);     %(zt)s = NULL;
+                Py_XDECREF(%(rt)s);     %(rt)s = NULL;
+                Py_XDECREF(%(hcan)s);   %(hcan)s = NULL;
+                Py_XDECREF(%(hht)s);    %(hht)s = NULL;
+
+                max_len = time_step;
             }
 
-            if (B == NULL) {
-                B = (%(d)s**)mkl_malloc(3 * time_step * sizeof (%(d)s*), 64);
+            if (NULL == A) {
+                A = (%(d)s**)mkl_malloc(3 * max_len * sizeof (%(d)s*), 64);
             }
 
-            if (C == NULL) {
-                C = (%(d)s**)mkl_malloc(3 * time_step * sizeof (%(d)s*), 64);
+            if (NULL == B) {
+                B = (%(d)s**)mkl_malloc(3 * max_len * sizeof (%(d)s*), 64);
+            }
+
+            if (NULL == C) {
+                C = (%(d)s**)mkl_malloc(3 * max_len * sizeof (%(d)s*), 64);
+            }
+
+            if (NULL == A || NULL == B || NULL == C) {
+                PyErr_SetString(PyExc_MemoryError,
+                                \"GRU: malloc A, B, C buffers for gemm_batch failed\");
+                goto gru_fail;
             }
 
             PyArrayObject* x_src     = NULL;
@@ -280,9 +327,15 @@ class GRU(gof.Op):
                 hinit_ptr = (%(d)s*) PyArray_DATA(%(hid_init)s);
             }
 
-            // x_hzr has shape (3 * time_step, batch_size, %(hid)s)
+            // x_hzr has shape (3 * max_len, batch_size, %(hid)s)
             if (NULL == x_hzr) {
-                x_hzr = (%(d)s*)mkl_malloc(time_step * 3 * batch_size * %(hid)s * sizeof (%(d)s), 64);
+                x_hzr = (%(d)s*)mkl_malloc(max_len * 3 * batch_size * %(hid)s * sizeof (%(d)s), 64);
+            }
+
+            if (NULL == x_hzr) {
+                PyErr_SetString(PyExc_MemoryError,
+                                \"GRU: fail to allocate buffer for x_hzr\");
+                goto gru_fail;
             }
 
         """ % locals()
@@ -319,7 +372,7 @@ class GRU(gof.Op):
             """ % locals()
         else:
             ccode += """    
-                memset((char*)x_hzr, 0, time_step * 3 * batch_size * %(hid)s * sizeof (%(d)s));
+                memset((char*)x_hzr, 0, max_len * 3 * batch_size * %(hid)s * sizeof (%(d)s));
             """ % locals()
 
         ccode += """
@@ -365,6 +418,29 @@ class GRU(gof.Op):
                     dims[1] = %(hid)s;
                     %(z)s = (PyArrayObject*) PyArray_ZEROS(2, dims, PyArray_TYPE(%(X)s), 0);
                 }
+            } else {
+                if (%(return_sequences)s) {
+                    if (PyArray_NDIM(%(z)s) != 3 ||
+                        PyArray_DIMS(%(z)s)[0] != time_step ||
+                        PyArray_DIMS(%(z)s)[1] != batch_size ||
+                        PyArray_DIMS(%(z)s)[2] != %(hid)s) {
+                        printf(\"delete output and recreate it\\n\");
+                        Py_DECREF(%(z)s);
+                        dims[0] = time_step;
+                        dims[1] = batch_size;
+                        dims[2] = %(hid)s;
+                        %(z)s = (PyArrayObject*) PyArray_ZEROS(3, dims, PyArray_TYPE(%(X)s), 0);
+                    }
+                } else {
+                    if (PyArray_NDIM(%(z)s) != 2 ||
+                        PyArray_DIMS(%(z)s)[0] != batch_size ||
+                        PyArray_DIMS(%(z)s)[1] != %(hid)s) {
+                        Py_DECREF(%(z)s);
+                        dims[0] = batch_size;
+                        dims[1] = %(hid)s;
+                        %(z)s = (PyArrayObject*) PyArray_ZEROS(2, dims, PyArray_TYPE(%(X)s), 0);
+                    }
+                }
             }
 
             if (NULL == %(z)s) {
@@ -374,31 +450,31 @@ class GRU(gof.Op):
 
             // zt, rt, hcan, hht are workspaces for backward computation
             if (NULL == %(zt)s) {
-                dims[0] = time_step;
+                dims[0] = max_len;
                 dims[1] = batch_size;
                 dims[2] = %(hid)s;
-                %(zt)s = (PyArrayObject*) PyArray_ZEROS(3, dims, PyArray_TYPE(%(X)s), 0);
+                %(zt)s = (PyArrayObject*) PyArray_EMPTY(3, dims, PyArray_TYPE(%(X)s), 0);
             }
 
             if (NULL == %(rt)s) {
-                dims[0] = time_step;
+                dims[0] = max_len;
                 dims[1] = batch_size;
                 dims[2] = %(hid)s;
-                %(rt)s = (PyArrayObject*) PyArray_ZEROS(3, dims, PyArray_TYPE(%(X)s), 0);
+                %(rt)s = (PyArrayObject*) PyArray_EMPTY(3, dims, PyArray_TYPE(%(X)s), 0);
             }
 
             if (NULL == %(hcan)s) {
-                dims[0] = time_step;
+                dims[0] = max_len;
                 dims[1] = batch_size;
                 dims[2] = %(hid)s;
-                %(hcan)s = (PyArrayObject*) PyArray_ZEROS(3, dims, PyArray_TYPE(%(X)s), 0);
+                %(hcan)s = (PyArrayObject*) PyArray_EMPTY(3, dims, PyArray_TYPE(%(X)s), 0);
             }
 
             if (NULL == %(hht)s) {
-                dims[0] = time_step;
+                dims[0] = max_len;
                 dims[1] = batch_size;
                 dims[2] = %(hid)s;
-                %(hht)s = (PyArrayObject*) PyArray_ZEROS(3, dims, PyArray_TYPE(%(X)s), 0);
+                %(hht)s = (PyArrayObject*) PyArray_EMPTY(3, dims, PyArray_TYPE(%(X)s), 0);
             }
 
             //// step 3: step on time_step
@@ -412,6 +488,12 @@ class GRU(gof.Op):
 
             if (NULL == temp) {
                 temp = (%(d)s*)mkl_malloc(batch_size * %(hid)s * sizeof (%(d)s), 64);
+            }
+
+            if (NULL == temp) {
+                PyErr_SetString(PyExc_MemoryError,
+                                \"GRU: fail to allocate buffer for temp\");
+                goto gru_fail;
             }
             memset((void*)temp, 0, batch_size * %(hid)s * sizeof (%(d)s));
 
@@ -483,7 +565,7 @@ class GRU(gof.Op):
                 }
 
                 // update
-                #pragma omp parallel for num_threads(16)
+                #pragma omp parallel for
                 for (int j = 0; j < mn; j++) {
                     z_ptr[j] = (%(d)s)( ((double)1.0 - (double)(zt_ptr[j])) * (double)(A[0][j]) + (double)(zt_ptr[j]) * (double)(hcan_ptr[j]));
                 }
@@ -492,7 +574,7 @@ class GRU(gof.Op):
                 A[1] = A[0];
                 A[2] = A[0];
             }
-
+            
             gru_fail:
             Py_XDECREF(x_src);
             Py_XDECREF(w_x_src);
@@ -509,24 +591,15 @@ class GRU(gof.Op):
         hid, zt, rt, hcan, hht = GRU(hid=self.hid,
                                      step=self.step,
                                      dim=self.dim,
-                                     return_sequences=self.return_sequences)(*inp)
-        """
-        gradi = GRUGradInputs(hid=self.hid,
-                              step=self.step,
-                              dim=self.dim,
-                              return_sequences=self.return_sequences)(Wx, Wh, hid, zt, rt, hcan, hht, gz)
+                                     return_sequences=self.return_sequences,
+                                     max_len=self.max_len)(*inp)
 
-        gradwx, gradwh = GRUGradWeights(hid=self.hid,
-                                        step=self.step,
-                                        dim=self.dim,
-                                        return_sequences=self.return_sequences)(X, Wh, hid, zt, rt, hcan, hht, gz)
-        """
-       
         if self.bias:
             GRUGrad = GRUGradients(hid=self.hid,
                                    step=self.step,
                                    dim=self.dim,
                                    return_sequences=self.return_sequences,
+                                   max_len=self.max_len,
                                    bias=True)
             gradi, gradwx, gradwh, gradhinit, gradbias = GRUGrad(X, Wx, Wh, hid, hid_init, zt, rt, hcan, hht, gz)
         else:
@@ -534,6 +607,7 @@ class GRU(gof.Op):
                                    step=self.step,
                                    dim=self.dim,
                                    return_sequences=self.return_sequences,
+                                   max_len=self.max_len,
                                    bias=False)
             gradi, gradwx, gradwh, gradhinit = GRUGrad(X, Wx, Wh, hid, hid_init, zt, rt, hcan, hht, gz)
             gradbias = None
@@ -544,4 +618,4 @@ class GRU(gof.Op):
             return [gradi, gradwx, gradwh, gradhinit, gradbias]
 
     def c_code_cache_version(self):
-        return (1, 0, 0)
+        return (1, 0, 1)

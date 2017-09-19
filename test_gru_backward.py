@@ -63,12 +63,12 @@ def GRU_MKL():
     B = T.dvector('b')
     Hid_init = T.dmatrix('hid_init')
 
-    Z = GRU(hid=1000, return_sequences=True)(X, W_x, W_h, Hid_init)
+    Z = GRU(hid=1000, return_sequences=True, max_len=100)(X, W_x, W_h, Hid_init)
 
     loss = Z[0].sum()
     gi, gwx, gwh, ghinit = theano.grad(loss, [X, W_x, W_h, Hid_init])
     f = theano.function([X, W_x, W_h, Hid_init], [gi, gwx, gwh, ghinit])
-    theano.printing.pydotprint(f, outfile='gru_backward.png', var_with_name_simple=True)
+    # theano.printing.pydotprint(f, outfile='gru_backward.png', var_with_name_simple=True)
 
     return f
 
@@ -92,14 +92,20 @@ if __name__ == '__main__':
     v_hid = np.zeros((80, 1000), np.float64)
     
     tic = time.time()
-    for i in range(100):
+    for i in range(10):
         out = f_theano(v_x, v_w_xh, v_w_xz, v_w_xr, v_w_hh, v_w_hz, v_w_hr, v_hid)
 
     toc = time.time()
     print('time: %.6f' %(toc - tic))
 
     tic = time.time()
-    for i in range(100):
+    for i in range(10):
         foo = f_mkl(v_x, v_w, v_wh, v_hid)
     toc = time.time()
     print('time: %.6f' %(toc - tic))
+
+    # accuracy
+    assert np.allclose(out[0], foo[0], atol=1e-7)
+    assert np.allclose(out[1], foo[1][0:620], atol=1e-7)
+    assert np.allclose(out[4], foo[2][0:1000], atol=1e-7)
+    assert np.allclose(out[-1], foo[3], atol=1e-7)

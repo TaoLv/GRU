@@ -6,13 +6,14 @@ from theano.tensor.blas import ldflags
 
 
 class GRUGradients(gof.Op):
-    __props__ = ('hid', 'step', 'dim', 'return_sequences')
+    __props__ = ('hid', 'step', 'dim', 'return_sequences', 'max_len', 'bias')
 
-    def __init__(self, hid, step=None, dim=None, return_sequences=False, bias=False):
+    def __init__(self, hid, step=None, dim=None, return_sequences=False, max_len=None, bias=False):
         self.hid = hid
         self.step = step
         self.dim = dim
         self.return_sequences = return_sequences
+        self.max_len = max_len    # it's not needed in backward computation
         self.bias = bias
         super(GRUGradients, self).__init__()
 
@@ -43,7 +44,6 @@ class GRUGradients(gof.Op):
             grads: gradient of next layer
 
         """
-
         inp = [X, Wx, Wh, hid, hid_init, zt, rt, hcan, hht, grads]
         inp = map(tensor.as_tensor_variable, inp)
 
@@ -227,7 +227,7 @@ class GRUGradients(gof.Op):
             PyArrayObject* hid_src   = NULL;
             PyArrayObject* hinit_src = NULL;
 
-            // vmlSetMode(vmlGetMode() & 0xFFFFFFF0 | VML_EP);
+           // vmlSetMode(vmlGetMode() & 0xFFFFFFF0 | VML_EP);
 
             if (!PyArray_IS_C_CONTIGUOUS(%(X)s)) {
                 printf(\"Warning: GRUGradients need convert X to C-Contiguous\\n\");
@@ -570,7 +570,6 @@ class GRUGradients(gof.Op):
 
             // dhinit is dhnext(0)
             memcpy ((void*)PyArray_DATA(%(ghinit)s), (void*)dhnext, batch_size * hid_dims * sizeof (%(d)s));
-
             gru_backward_fail:
             Py_XDECREF(x_src);
             Py_XDECREF(wx_src);
@@ -581,5 +580,5 @@ class GRUGradients(gof.Op):
         return ccode
 
     def c_code_cache_version(self):
-        return (1, 0, 0)
+        return (1, 0, 1)
 
